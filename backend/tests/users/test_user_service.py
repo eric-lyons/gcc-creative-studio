@@ -14,7 +14,7 @@
 """Tests for User Service."""
 
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -55,7 +55,9 @@ class TestCreateUserIfNotExists:
 
         # Assertions
         assert result == mock_user
-        mock_user_repo.get_by_email.assert_called_once_with("user@example.com")
+        mock_user_repo.get_by_email.assert_called_once_with(
+            "user@example.com", include_deleted=True
+        )
         # Verify create was NOT called
         mock_user_repo.create.assert_not_called()
 
@@ -77,7 +79,9 @@ class TestCreateUserIfNotExists:
 
         # Assertions
         assert result == mock_user
-        mock_user_repo.get_by_email.assert_called_once_with("new@example.com")
+        mock_user_repo.get_by_email.assert_called_once_with(
+            "new@example.com", include_deleted=True
+        )
 
         # Verify create was called with correct data
         called_args = mock_user_repo.create.call_args[0][0]
@@ -133,10 +137,8 @@ class TestUpdateUserRole:
         # Setup: User IS an admin
         mock_user_repo.get_by_id.return_value = mock_admin
 
-        # Mock DB execute to return 1 (only 1 admin left)
-        mock_result = MagicMock()
-        mock_result.scalar.return_value = 1
-        mock_user_repo.db.execute.return_value = mock_result
+        # Mock repo to report only 1 admin left
+        mock_user_repo.count_admins.return_value = 1
 
         # Action: Try to demote to regular user
         role_data = UserUpdateRoleDto(roles=[UserRoleEnum.USER])

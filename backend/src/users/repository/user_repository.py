@@ -30,15 +30,30 @@ class UserRepository(BaseRepository[User, UserModel]):
     def __init__(self, db: AsyncSession = Depends(get_db)):
         super().__init__(model=User, schema=UserModel, db=db)
 
-    async def get_by_email(self, email: str) -> UserModel | None:
-        """Finds a single user by their email address."""
+    async def get_by_email(
+        self, email: str, include_deleted: bool = False
+    ) -> UserModel | None:
+        """Finds a single user by email. Emails are stored lowercase, so an
+        equality match on the lowercased input stays on the users.email index.
+        """
         result = await self.db.execute(
-            select(self.model).where(self.model.email == email),
+            select(self.model)
+            .where(self.model.email == email.strip().lower())
+            .execution_options(include_deleted=include_deleted),
         )
         user = result.scalar_one_or_none()
         if not user:
             return None
         return self.schema.model_validate(user)
+
+    async def count_admins(self) -> int:
+        """Counts active users holding the admin role."""
+        result = await self.db.execute(
+            select(func.count())
+            .select_from(self.model)
+            .where(self.model.roles.contains(["admin"]))
+        )
+        return result.scalar() or 0
 
     async def query(
         self,
