@@ -54,18 +54,66 @@ class UserService:
         email: str,
         name: str,
         picture: str | None,
+        entra_oid: str | None = None,
     ) -> UserModel:
         """Gets or JIT-creates the user and, when Entra role sync is enabled,
         reconciles admin/creator/workflows roles against Entra group
         membership at most once per ENTRA_ROLE_SYNC_TTL_SECONDS.
 
-        Cost per request: one SELECT; plus one Graph lookup and one UPDATE
-        only when the TTL has expired.
+        Users with `entra_oid` are keyed by that immutable object ID. An
+        existing unlinked row with the same email is linked once (confirmed via
+        Microsoft Graph when role sync is enabled).
         """
         email = email.strip().lower()
-        existing_user = await self.user_repo.get_by_email(
-            email, include_deleted=True
-        )
+        if entra_oid is not None:
+            entra_oid = entra_oid.strip().lower() or None
+
+        sync_enabled = config_service.ENTRA_ROLE_SYNC_ENABLED
+        pending_link_oid: str | None = None
+
+        if entra_oid is not None:
+            existing_user = await self.user_repo.get_by_entra_oid(
+                entra_oid, include_deleted=True
+            )
+            if existing_user is None:
+                email_user = await self.user_repo.get_by_email(
+                    email, include_deleted=True
+                )
+                if email_user is not None:
+                    if email_user.deleted_at is not None:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Forbidden: this account has been deactivated.",
+                        )
+                    if (
+                        email_user.entra_oid is not None
+                        and email_user.entra_oid != entra_oid
+                    ):
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail=(
+                                "Forbidden: email is already linked to a "
+                                "different Entra identity."
+                            ),
+                        )
+                    if sync_enabled:
+                        await self._confirm_oid_email_via_graph(
+                            entra_oid, email
+                        )
+                    else:
+                        logger.info(
+                            "Linking existing user %s to Entra OID %s "
+                            "(Entra role sync disabled).",
+                            email,
+                            entra_oid,
+                        )
+                    pending_link_oid = entra_oid
+                    existing_user = email_user
+        else:
+            existing_user = await self.user_repo.get_by_email(
+                email, include_deleted=True
+            )
+
         if existing_user and existing_user.deleted_at is not None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -73,14 +121,19 @@ class UserService:
             )
 
         now = datetime.datetime.now(datetime.UTC)
-        sync_enabled = config_service.ENTRA_ROLE_SYNC_ENABLED
 
         if existing_user is None:
             user_data = UserCreateDto(
-                email=email, name=name, picture=picture or ""
-            ).model_dump()
+                email=email,
+                name=name,
+                picture=picture or "",
+                entra_oid=entra_oid,
+            ).model_dump(exclude_none=True)
+            lookup_ref = entra_oid or email
             entra_roles = (
-                await self._fetch_entra_roles(email) if sync_enabled else None
+                await self._fetch_entra_roles(lookup_ref, email)
+                if sync_enabled
+                else None
             )
             user_data["roles"] = _role_values(
                 entra_roles or {UserRoleEnum.USER}
@@ -90,12 +143,24 @@ class UserService:
             return await self.user_repo.create(user_data)
 
         if not sync_enabled or not _roles_check_due(existing_user, now):
+            if pending_link_oid is not None:
+                return (
+                    await self.user_repo.update(
+                        existing_user.id, {"entra_oid": pending_link_oid}
+                    )
+                    or existing_user
+                )
             return existing_user
 
         # TTL expired: bump the marker even if Graph fails (fail-static,
         # retry after the next TTL) so an outage doesn't hammer Graph.
         updates: dict[str, Any] = {"roles_checked_at": now}
-        entra_roles = await self._fetch_entra_roles(email)
+        if pending_link_oid is not None:
+            updates["entra_oid"] = pending_link_oid
+        lookup_ref = entra_oid or existing_user.entra_oid or existing_user.email
+        entra_roles = await self._fetch_entra_roles(
+            lookup_ref, existing_user.email
+        )
         if entra_roles is not None:
             target = await self._apply_last_admin_safeguard(
                 existing_user, entra_roles
@@ -105,7 +170,7 @@ class UserService:
                 updates["roles"] = _role_values(target)
                 logger.info(
                     "Entra role sync for %s: %s -> %s",
-                    email,
+                    existing_user.email,
                     _role_values(current),
                     updates["roles"],
                 )
@@ -114,18 +179,61 @@ class UserService:
             or existing_user
         )
 
-    async def _fetch_entra_roles(self, email: str) -> set[UserRoleEnum] | None:
+    async def _confirm_oid_email_via_graph(
+        self, entra_oid: str, email: str
+    ) -> None:
+        """Confirms via Graph GET /users/{oid} that `email` belongs to `entra_oid`."""
+        client = get_entra_graph_client()
+        if client is None:
+            return
+        try:
+            graph_emails = await client.get_user_emails(entra_oid)
+        except EntraGraphError as exc:
+            logger.error(
+                "Failed to confirm Entra OID %s for %s via Graph: %s",
+                entra_oid,
+                email,
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Unable to verify user identity with Microsoft Graph; "
+                    "please try again later."
+                ),
+            ) from exc
+        if email.strip().lower() not in graph_emails:
+            logger.warning(
+                "Refusing to link existing user %s to Entra OID %s: Graph "
+                "reported emails %s",
+                email,
+                entra_oid,
+                sorted(graph_emails),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Forbidden: Entra user profile email does not match "
+                    "existing account."
+                ),
+            )
+
+    async def _fetch_entra_roles(
+        self, user_ref: str, log_email: str | None = None
+    ) -> set[UserRoleEnum] | None:
         """Roles granted by Entra group membership, or None on any failure."""
         client = get_entra_graph_client()
         if client is None:
             return None
         group_roles = config_service.ENTRA_GROUP_ROLES
         try:
-            matched = await client.member_group_ids(email, group_roles.keys())
+            matched = await client.member_group_ids(
+                user_ref, group_roles.keys()
+            )
         except EntraGraphError as exc:
             logger.error(
                 "Entra role sync failed for %s; keeping existing roles: %s",
-                email,
+                log_email or user_ref,
                 exc,
             )
             return None

@@ -39,11 +39,11 @@ _TOKEN_EXPIRY_SKEW_SECONDS = 60
 
 
 class EntraGraphError(Exception):
-    """Graph or token endpoint failed; callers keep existing roles."""
+    """Graph or token endpoint failed."""
 
 
 class EntraUserNotFoundError(EntraGraphError):
-    """No unique Entra user matched the email."""
+    """Entra user was not found in Microsoft Graph."""
 
 
 class EntraGraphClient:
@@ -68,28 +68,45 @@ class EntraGraphClient:
         self._inflight: dict[str, asyncio.Future[set[str]]] = {}
 
     async def member_group_ids(
-        self, email: str, group_ids: Iterable[str]
+        self, user_id: str, group_ids: Iterable[str]
     ) -> set[str]:
         """Returns the lowercased subset of `group_ids` the user belongs to.
 
-        Concurrent calls for the same email share one Graph round trip.
+        `user_id` is the Entra object ID (`oid`). Concurrent calls for the same
+        user share one Graph round trip.
         """
-        task = self._inflight.get(email)
+        key = user_id.strip().lower()
+        task = self._inflight.get(key)
         if task is None:
-            task = asyncio.ensure_future(self._lookup(email, sorted(group_ids)))
-            self._inflight[email] = task
-            task.add_done_callback(lambda _: self._inflight.pop(email, None))
+            task = asyncio.ensure_future(
+                self._check_member_groups(
+                    quote(key, safe="@"), sorted(group_ids)
+                )
+            )
+            self._inflight[key] = task
+            task.add_done_callback(lambda _: self._inflight.pop(key, None))
         return await asyncio.shield(task)
 
-    async def _lookup(self, email: str, group_ids: list[str]) -> set[str]:
-        try:
-            # Most tenants use the email as the UPN: one call on the happy path.
-            return await self._check_member_groups(
-                quote(email, safe="@"), group_ids
-            )
-        except EntraUserNotFoundError:
-            user_id = await self._find_user_id_by_mail(email)
-            return await self._check_member_groups(user_id, group_ids)
+    async def get_user_emails(self, oid: str) -> set[str]:
+        """Returns lowercased non-empty `{mail, userPrincipalName}` for `oid`."""
+        user_ref = quote(oid.strip().lower(), safe="")
+        body = await self._request_object(
+            "GET",
+            f"/users/{user_ref}",
+            params={"$select": "id,mail,userPrincipalName"},
+        )
+        emails: set[str] = set()
+        for field in ("mail", "userPrincipalName"):
+            raw = body.get(field)
+            if raw is None:
+                continue
+            if not isinstance(raw, str):
+                raise EntraGraphError(
+                    f"Malformed Graph user {user_ref}: {field} is not a string"
+                )
+            if raw.strip():
+                emails.add(raw.strip().lower())
+        return emails
 
     async def _check_member_groups(
         self, user_ref: str, group_ids: list[str]
@@ -113,37 +130,11 @@ class EntraGraphClient:
             matched.update(g.lower() for g in value)
         return matched
 
-    async def _find_user_id_by_mail(self, email: str) -> str:
-        literal = email.replace("'", "''")  # OData string-literal escaping
-        users = await self._request(
-            "GET",
-            "/users",
-            params={
-                "$filter": (
-                    f"mail eq '{literal}' or "
-                    f"otherMails/any(m:m eq '{literal}')"
-                ),
-                "$select": "id",
-                "$count": "true",
-            },
-            headers={"ConsistencyLevel": "eventual"},
-        )
-        if len(users) != 1:
-            raise EntraUserNotFoundError(
-                f"{len(users)} Entra users match mail {email!r}"
-            )
-        try:
-            return users[0]["id"]
-        except (KeyError, TypeError) as exc:
-            raise EntraGraphError(
-                f"Malformed Graph user entry for mail {email!r}: {exc}"
-            ) from exc
-
-    async def _request(
+    async def _request_object(
         self, method: str, path: str, headers: dict | None = None, **kwargs
-    ) -> list:
-        """Returns the `value` list of a Graph response; any malformed body
-        raises EntraGraphError so callers keep existing roles."""
+    ) -> dict:
+        """Returns the JSON object body of a Graph response; any HTTP error or
+        malformed body raises EntraGraphError."""
         token = await self._get_app_token()
         try:
             response = await self._http.request(
@@ -161,8 +152,29 @@ class EntraGraphClient:
                 f"Graph HTTP {response.status_code} for {path}"
             )
         try:
-            value = response.json()["value"]
-        except (ValueError, KeyError, TypeError) as exc:
+            body = response.json()
+        except ValueError as exc:
+            raise EntraGraphError(
+                f"Malformed Graph response for {path}: {exc}"
+            ) from exc
+        if not isinstance(body, dict):
+            raise EntraGraphError(
+                f"Malformed Graph response for {path}: body is "
+                f"{type(body).__name__}, not dict"
+            )
+        return body
+
+    async def _request(
+        self, method: str, path: str, headers: dict | None = None, **kwargs
+    ) -> list:
+        """Returns the `value` list of a Graph response; any malformed body
+        raises EntraGraphError."""
+        body = await self._request_object(
+            method, path, headers=headers, **kwargs
+        )
+        try:
+            value = body["value"]
+        except KeyError as exc:
             raise EntraGraphError(
                 f"Malformed Graph response for {path}: {exc}"
             ) from exc

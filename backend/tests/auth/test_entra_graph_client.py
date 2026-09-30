@@ -31,10 +31,14 @@ TOKEN_HOST = "login.microsoftonline.com"
 class FakeGraph:
     """Records requests and serves canned Graph / token responses."""
 
-    def __init__(self, members=(), upn_exists=True, mail_matches=1):
+    def __init__(self, members=(), user_exists=True, user_profile=None):
         self.members = {m.lower() for m in members}
-        self.upn_exists = upn_exists
-        self.mail_matches = mail_matches
+        self.user_exists = user_exists
+        self.user_profile = user_profile or {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "mail": "Alice@Corp.com",
+            "userPrincipalName": "alice.upn@corp.com",
+        }
         self.requests: list[httpx.Request] = []
         self.graph_status: int | None = None
         self.raise_transport = False
@@ -53,23 +57,18 @@ class FakeGraph:
         if self.graph_status:
             return httpx.Response(self.graph_status)
         path = request.url.path
-        if path == "/v1.0/users" and request.method == "GET":
-            return httpx.Response(
-                200,
-                json={
-                    "value": [
-                        {"id": f"id{i}"} for i in range(self.mail_matches)
-                    ]
-                },
-            )
         if path.endswith("/checkMemberGroups"):
-            if "@" in path and not self.upn_exists:
+            if not self.user_exists:
                 return httpx.Response(404)
             ids = json.loads(request.content)["groupIds"]
             return httpx.Response(
                 200,
                 json={"value": [g for g in ids if g.lower() in self.members]},
             )
+        if path.startswith("/v1.0/users/") and request.method == "GET":
+            if not self.user_exists:
+                return httpx.Response(404)
+            return httpx.Response(200, json=self.user_profile)
         return httpx.Response(500)
 
     def calls(self, host_or_suffix: str) -> list[httpx.Request]:
@@ -91,19 +90,17 @@ def make_client(fake: FakeGraph) -> EntraGraphClient:
 
 
 @pytest.mark.anyio
-async def test_happy_path_uses_upn_and_one_graph_call():
+async def test_happy_path_uses_oid_and_one_graph_call():
     fake = FakeGraph(members={"AAA"})
     client = make_client(fake)
+    oid = "11111111-2222-3333-4444-555555555555"
 
-    result = await client.member_group_ids("alice@corp.com", ["aaa", "bbb"])
+    result = await client.member_group_ids(oid, ["aaa", "bbb"])
 
     assert result == {"aaa"}
     graph_calls = fake.calls("/checkMemberGroups")
     assert len(graph_calls) == 1
-    assert (
-        graph_calls[0].url.path
-        == "/v1.0/users/alice@corp.com/checkMemberGroups"
-    )
+    assert graph_calls[0].url.path == f"/v1.0/users/{oid}/checkMemberGroups"
     assert graph_calls[0].headers["Authorization"] == "Bearer tok"
 
 
@@ -140,30 +137,44 @@ async def test_group_ids_are_chunked_at_20_per_call():
 
 
 @pytest.mark.anyio
-async def test_upn_404_falls_back_to_mail_filter_with_escaping():
-    fake = FakeGraph(members={"g1"}, upn_exists=False)
-    client = make_client(fake)
-
-    result = await client.member_group_ids("o'neil@corp.com", ["g1"])
-
-    assert result == {"g1"}
-    lookup = next(r for r in fake.requests if r.url.path == "/v1.0/users")
-    assert lookup.headers["ConsistencyLevel"] == "eventual"
-    assert lookup.url.params["$count"] == "true"
-    assert "mail eq 'o''neil@corp.com'" in lookup.url.params["$filter"]
-    assert fake.calls("/checkMemberGroups")[-1].url.path == (
-        "/v1.0/users/id0/checkMemberGroups"
-    )
-
-
-@pytest.mark.parametrize("matches", [0, 2])
-@pytest.mark.anyio
-async def test_mail_fallback_requires_exactly_one_match(matches):
-    fake = FakeGraph(upn_exists=False, mail_matches=matches)
+async def test_check_member_groups_404_raises_without_mail_fallback():
+    fake = FakeGraph(user_exists=False)
     client = make_client(fake)
 
     with pytest.raises(EntraUserNotFoundError):
-        await client.member_group_ids("a@corp.com", ["g1"])
+        await client.member_group_ids(
+            "11111111-2222-3333-4444-555555555555", ["g1"]
+        )
+
+    assert len(fake.calls("/checkMemberGroups")) == 1
+    assert not any(r.url.path == "/v1.0/users" for r in fake.requests)
+
+
+@pytest.mark.anyio
+async def test_get_user_emails_returns_lowercased_mail_and_upn():
+    fake = FakeGraph(
+        user_profile={
+            "id": "11111111-2222-3333-4444-555555555555",
+            "mail": " Alice@Corp.COM ",
+            "userPrincipalName": "Alice.UPN@Corp.COM",
+        }
+    )
+    client = make_client(fake)
+
+    emails = await client.get_user_emails(
+        "11111111-2222-3333-4444-555555555555"
+    )
+
+    assert emails == {"alice@corp.com", "alice.upn@corp.com"}
+
+
+@pytest.mark.anyio
+async def test_get_user_emails_404_raises_user_not_found():
+    fake = FakeGraph(user_exists=False)
+    client = make_client(fake)
+
+    with pytest.raises(EntraUserNotFoundError):
+        await client.get_user_emails("11111111-2222-3333-4444-555555555555")
 
 
 @pytest.mark.anyio
@@ -275,16 +286,19 @@ async def test_malformed_check_member_groups_body_raises_entra_graph_error(
 
 @pytest.mark.parametrize(
     "body",
-    [{"value": [{}]}, {"value": ["x"]}],
-    ids=["user-without-id", "non-object-user"],
+    [
+        b"not json",
+        [],
+        {"mail": 123},
+        {"userPrincipalName": ["not-a-str"]},
+    ],
+    ids=["non-json", "list-body", "non-str-mail", "non-str-upn"],
 )
 @pytest.mark.anyio
-async def test_malformed_mail_lookup_body_raises_entra_graph_error(body):
+async def test_malformed_get_user_emails_body_raises_entra_graph_error(body):
     async def handler(request):
         if request.url.host == TOKEN_HOST:
             return httpx.Response(200, json={"access_token": "tok"})
-        if request.url.path.endswith("/checkMemberGroups"):
-            return httpx.Response(404)
         return _body_response(body)
 
     client = EntraGraphClient(
@@ -294,7 +308,7 @@ async def test_malformed_mail_lookup_body_raises_entra_graph_error(body):
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     with pytest.raises(EntraGraphError):
-        await client.member_group_ids("a@corp.com", ["g1"])
+        await client.get_user_emails("11111111-2222-3333-4444-555555555555")
 
 
 @pytest.mark.anyio

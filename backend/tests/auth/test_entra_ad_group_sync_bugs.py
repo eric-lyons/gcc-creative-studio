@@ -56,13 +56,13 @@ def _user(**overrides) -> UserModel:
 
 
 class TestRoleSourceIsNotTheIapToken:
-    def test_wif_attribute_mapping_is_unchanged(self):
+    def test_wif_attribute_mapping_uses_oid_subject(self):
         """IAP drops google.groups from its JWT, so mapping it is dead weight,
-        and changing google.subject would re-key every existing principal."""
+        and google.subject maps to assertion.oid (immutable Entra object ID)."""
         content = (
             REPO_ROOT / "infra/modules/iap-load-balancer/main.tf"
         ).read_text(encoding="utf-8")
-        assert '"google.subject"      = "assertion.sub"' in content
+        assert '"google.subject"      = "assertion.oid"' in content
         assert "google.groups" not in content
 
     @pytest.mark.anyio
@@ -116,12 +116,11 @@ class TestAuthDefectsStayFixed:
 
     @pytest.mark.anyio
     @patch("src.auth.auth_guard.id_token.verify_token")
-    async def test_sub_only_token_is_rejected_when_allowed_orgs_set(
+    async def test_sub_only_token_is_rejected_even_without_allowed_orgs(
         self, mock_verify
     ):
-        """A WIF principal URI has no email domain, so an org allowlist
-        rejects it (fail closed) instead of provisioning a junk user."""
-        config_service.ALLOWED_ORGS_STR = "yourcompany.com"
+        """A WIF principal URI without an email claim or a non-GUID subject is
+        rejected (fail closed) instead of using sub as email."""
         mock_verify.return_value = {
             "sub": "principal://iam.googleapis.com/locations/global/"
             "workforcePools/pool/subject/abc123"
