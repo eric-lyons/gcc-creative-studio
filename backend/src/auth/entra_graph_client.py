@@ -87,15 +87,21 @@ class EntraGraphClient:
             task.add_done_callback(lambda _: self._inflight.pop(key, None))
         return await asyncio.shield(task)
 
-    async def get_user_emails(self, oid: str) -> set[str]:
-        """Returns lowercased non-empty `{mail, userPrincipalName}` for `oid`."""
+    async def get_user_profile(
+        self, oid: str
+    ) -> tuple[str | None, str | None, set[str]]:
+        """Returns `(primary_email, display_name, all_emails)` for `oid`.
+
+        Queries `GET /v1.0/users/{oid}?$select=id,mail,userPrincipalName,displayName`.
+        `primary_email` prefers `mail` over `userPrincipalName` (lowercased).
+        """
         user_ref = quote(oid.strip().lower(), safe="")
         body = await self._request_object(
             "GET",
             f"/users/{user_ref}",
-            params={"$select": "id,mail,userPrincipalName"},
+            params={"$select": "id,mail,userPrincipalName,displayName"},
         )
-        emails: set[str] = set()
+        ordered_emails: list[str] = []
         for field in ("mail", "userPrincipalName"):
             raw = body.get(field)
             if raw is None:
@@ -104,8 +110,26 @@ class EntraGraphClient:
                 raise EntraGraphError(
                     f"Malformed Graph user {user_ref}: {field} is not a string"
                 )
-            if raw.strip():
-                emails.add(raw.strip().lower())
+            cleaned = raw.strip().lower()
+            if cleaned and "@" in cleaned and cleaned not in ordered_emails:
+                ordered_emails.append(cleaned)
+
+        raw_name = body.get("displayName")
+        if raw_name is not None and not isinstance(raw_name, str):
+            raise EntraGraphError(
+                f"Malformed Graph user {user_ref}: displayName is not a string"
+            )
+        display_name = (
+            raw_name.strip()
+            if isinstance(raw_name, str) and raw_name.strip()
+            else None
+        )
+        primary_email = ordered_emails[0] if ordered_emails else None
+        return primary_email, display_name, set(ordered_emails)
+
+    async def get_user_emails(self, oid: str) -> set[str]:
+        """Returns lowercased non-empty `{mail, userPrincipalName}` for `oid`."""
+        _, _, emails = await self.get_user_profile(oid)
         return emails
 
     async def _check_member_groups(
@@ -224,8 +248,12 @@ class EntraGraphClient:
 
 @lru_cache(maxsize=1)
 def get_entra_graph_client() -> EntraGraphClient | None:
-    """Process-wide client, or None when Entra role sync is not configured."""
-    if not config_service.ENTRA_ROLE_SYNC_ENABLED:
+    """Process-wide client, or None when Entra Graph credentials are not set."""
+    if not (
+        config_service.ENTRA_TENANT_ID
+        and config_service.ENTRA_GRAPH_CLIENT_ID
+        and config_service.ENTRA_GRAPH_CLIENT_SECRET
+    ):
         return None
     return EntraGraphClient(
         tenant_id=config_service.ENTRA_TENANT_ID,

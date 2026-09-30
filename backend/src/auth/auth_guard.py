@@ -191,28 +191,33 @@ async def get_current_user(
         if not email:
             email = decoded_token.get("upn")
 
-        if not email or not isinstance(email, str) or "@" not in email:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=(
-                    "Unauthorized: User email could not be confirmed from "
-                    "IAP token."
-                ),
-            )
+        has_token_email = (
+            bool(email) and isinstance(email, str) and "@" in email
+        )
+        if not has_token_email:
+            if entra_oid is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=(
+                        "Unauthorized: User email could not be confirmed from "
+                        "IAP token."
+                    ),
+                )
+            email = None
 
-        name = decoded_token.get("name", email.split("@")[0])
+        name = decoded_token.get("name") or (
+            email.split("@")[0] if email else ""
+        )
         picture = decoded_token.get("picture", "")
 
         token_info_hd = decoded_token.get("hd")
-        if not token_info_hd:
+        if not token_info_hd and email:
             token_info_hd = email.split("@")[-1]
 
-        # If ALLOWED_ORGS is configured, check the user's organization (case-insensitive).
-        if config_service.ALLOWED_ORGS:
-            if (
-                not token_info_hd
-                or token_info_hd.lower() not in config_service.ALLOWED_ORGS
-            ):
+        # If ALLOWED_ORGS is configured and domain is present on the token,
+        # check the user's organization (case-insensitive) before DB/Graph calls.
+        if config_service.ALLOWED_ORGS and token_info_hd:
+            if token_info_hd.lower() not in config_service.ALLOWED_ORGS:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail=(
@@ -223,7 +228,8 @@ async def get_current_user(
 
         # Just-In-Time (JIT) User Provisioning:
         # Create a user profile in our database on their first API call.
-        # Roles are reconciled against Entra ID (Microsoft Graph) inside the service.
+        # When email is absent from a Workforce IAP token, UserService resolves
+        # mail / userPrincipalName from Microsoft Graph using entra_oid.
         create_kwargs: dict[str, Any] = {
             "email": email,
             "name": name,
@@ -239,8 +245,28 @@ async def get_current_user(
                 detail="Could not create or retrieve user profile.",
             )
 
+        if config_service.ALLOWED_ORGS and not token_info_hd:
+            resolved_hd = (
+                user_doc.email.split("@")[-1]
+                if user_doc.email and "@" in user_doc.email
+                else ""
+            )
+            if (
+                not resolved_hd
+                or resolved_hd.lower() not in config_service.ALLOWED_ORGS
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=(
+                        f"User from '{resolved_hd}' is not part of an "
+                        "allowed organization."
+                    ),
+                )
+
         if not user_doc.picture and picture:
-            logger.info("Updating picture for user: %s", email)
+            logger.info(
+                "Updating picture for user: %s", user_doc.email or email
+            )
             user_doc.picture = picture
             if user_doc.id:
                 await user_service.user_repo.update(

@@ -19,7 +19,11 @@ from typing import Any
 
 from fastapi import Depends, HTTPException, status
 
-from src.auth.entra_graph_client import EntraGraphError, get_entra_graph_client
+from src.auth.entra_graph_client import (
+    EntraGraphError,
+    EntraUserNotFoundError,
+    get_entra_graph_client,
+)
 from src.common.dto.pagination_response_dto import PaginationResponseDto
 from src.config.config_service import config_service
 from src.users.dto.user_create_dto import UserCreateDto, UserUpdateRoleDto
@@ -53,6 +57,21 @@ def _is_deployer_admin(email: str) -> bool:
     return email.strip().lower() == admin_email
 
 
+def _check_allowed_org(email: str) -> None:
+    """Enforces IDENTITY_PLATFORM_ALLOWED_ORGS when email is resolved via DB/Graph."""
+    allowed_orgs = getattr(config_service, "ALLOWED_ORGS", None)
+    if not allowed_orgs:
+        return
+    domain = email.split("@")[-1].lower() if "@" in email else ""
+    if not domain or domain not in allowed_orgs:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                f"User from '{domain}' is not part of an allowed organization."
+            ),
+        )
+
+
 class UserService:
     """Handles the business logic for user management."""
 
@@ -61,7 +80,7 @@ class UserService:
 
     async def create_user_if_not_exists(
         self,
-        email: str,
+        email: str | None,
         name: str,
         picture: str | None,
         entra_oid: str | None = None,
@@ -70,28 +89,53 @@ class UserService:
         reconciles admin/creator/workflows roles against Entra group
         membership at most once per ENTRA_ROLE_SYNC_TTL_SECONDS.
 
-        Users with `entra_oid` are keyed by that immutable object ID. An
-        existing unlinked row with the same email is linked once (confirmed via
-        Microsoft Graph when role sync is enabled). On any Graph sync failure,
-        privileged roles (`admin`, `creator`, `workflows`) are removed
-        immediately except for the deployer (`ADMIN_USER_EMAIL`), who always
-        retains `admin`.
+        Users with `entra_oid` are keyed by that immutable object ID. When the
+        IAP token omits `email` for a workforce user, `mail` /
+        `userPrincipalName` (and `displayName` when `name` is empty) are
+        resolved from Microsoft Graph using `entra_oid`. An existing unlinked
+        row with the same email is linked once (confirmed via Microsoft Graph
+        when role sync is enabled). On any Graph sync failure, privileged roles
+        (`admin`, `creator`, `workflows`) are removed immediately except for
+        the deployer (`ADMIN_USER_EMAIL`), who always retains `admin`.
         """
-        email = email.strip().lower()
+        caller_supplied_email = bool(email and email.strip())
+        email = (email or "").strip().lower()
         if entra_oid is not None:
             entra_oid = entra_oid.strip().lower() or None
 
         sync_enabled = config_service.ENTRA_ROLE_SYNC_ENABLED
         pending_link_oid: str | None = None
+        email_from_graph = False
+        graph_emails: set[str] = set()
 
         if entra_oid is not None:
             existing_user = await self.user_repo.get_by_entra_oid(
                 entra_oid, include_deleted=True
             )
+            if existing_user is not None and not caller_supplied_email:
+                _check_allowed_org(existing_user.email)
             if existing_user is None:
-                email_user = await self.user_repo.get_by_email(
-                    email, include_deleted=True
-                )
+                if not email:
+                    (
+                        email,
+                        graph_display_name,
+                        graph_emails,
+                    ) = await self._resolve_oid_profile_via_graph(entra_oid)
+                    email_from_graph = True
+                    if not name and graph_display_name:
+                        name = graph_display_name
+                    _check_allowed_org(email)
+
+                candidate_emails = [email] + [
+                    e for e in sorted(graph_emails) if e != email
+                ]
+                email_user = None
+                for candidate in candidate_emails:
+                    email_user = await self.user_repo.get_by_email(
+                        candidate, include_deleted=True
+                    )
+                    if email_user is not None:
+                        break
                 if email_user is not None:
                     if email_user.deleted_at is not None:
                         raise HTTPException(
@@ -109,20 +153,28 @@ class UserService:
                                 "different Entra identity."
                             ),
                         )
-                    if sync_enabled:
+                    if sync_enabled and not email_from_graph:
                         await self._confirm_oid_email_via_graph(
                             entra_oid, email
                         )
-                    else:
+                    elif not sync_enabled:
                         logger.info(
                             "Linking existing user %s to Entra OID %s "
                             "(Entra role sync disabled).",
-                            email,
+                            email_user.email,
                             entra_oid,
                         )
                     pending_link_oid = entra_oid
                     existing_user = email_user
         else:
+            if not email:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=(
+                        "Unauthorized: User email could not be confirmed from "
+                        "IAP token."
+                    ),
+                )
             existing_user = await self.user_repo.get_by_email(
                 email, include_deleted=True
             )
@@ -136,6 +188,8 @@ class UserService:
         now = datetime.datetime.now(datetime.UTC)
 
         if existing_user is None:
+            if not name:
+                name = email.split("@")[0]
             user_data = UserCreateDto(
                 email=email,
                 name=name,
@@ -149,8 +203,11 @@ class UserService:
                 else None
             )
             initial_roles = entra_roles or {UserRoleEnum.USER}
-            if sync_enabled and _is_deployer_admin(email):
-                if entra_oid is not None:
+            if sync_enabled and (
+                _is_deployer_admin(email)
+                or any(_is_deployer_admin(e) for e in graph_emails)
+            ):
+                if entra_oid is not None and not email_from_graph:
                     # Confirm that the OID actually owns ADMIN_USER_EMAIL in Graph
                     # before granting break-glass admin on an unseeded JIT row.
                     try:
@@ -163,9 +220,7 @@ class UserService:
                     except HTTPException:
                         pass
                 else:
-                    initial_roles = self._apply_deployer_admin_safeguard(
-                        email, initial_roles
-                    )
+                    initial_roles = initial_roles | {UserRoleEnum.ADMIN}
             user_data["roles"] = _role_values(initial_roles)
             if sync_enabled:
                 user_data["roles_checked_at"] = now
@@ -210,6 +265,59 @@ class UserService:
             await self.user_repo.update(existing_user.id, updates)
             or existing_user
         )
+
+    async def _resolve_oid_profile_via_graph(
+        self, entra_oid: str
+    ) -> tuple[str, str | None, set[str]]:
+        """Resolves `(primary_email, display_name, all_emails)` for `entra_oid`
+        via Microsoft Graph when the IAP JWT omits the `email` claim."""
+        client = get_entra_graph_client()
+        if client is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=(
+                    "Unauthorized: User email could not be confirmed from "
+                    "IAP token."
+                ),
+            )
+        try:
+            primary_email, display_name, all_emails = (
+                await client.get_user_profile(entra_oid)
+            )
+        except EntraUserNotFoundError as exc:
+            logger.warning(
+                "Entra OID %s not found in Microsoft Graph: %s", entra_oid, exc
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: Entra user was not found in Microsoft Graph.",
+            ) from exc
+        except EntraGraphError as exc:
+            logger.error(
+                "Failed to resolve email for Entra OID %s via Graph: %s",
+                entra_oid,
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Unable to verify user identity with Microsoft Graph; "
+                    "please try again later."
+                ),
+            ) from exc
+        if not primary_email:
+            logger.warning(
+                "Entra OID %s has no mail or userPrincipalName in Graph.",
+                entra_oid,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Forbidden: Entra user profile does not have a valid "
+                    "email or userPrincipalName."
+                ),
+            )
+        return primary_email, display_name, all_emails
 
     async def _confirm_oid_email_via_graph(
         self, entra_oid: str, email: str

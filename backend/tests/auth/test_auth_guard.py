@@ -264,7 +264,48 @@ class TestGetCurrentUser:
 
     @pytest.mark.anyio
     @patch("src.auth.auth_guard.id_token.verify_token")
-    async def test_get_current_user_iap_missing_email_does_not_fallback_to_sub(
+    async def test_get_current_user_iap_workforce_missing_email_delegates_oid_without_sub_fallback(
+        self, mock_verify, mock_user_service
+    ):
+        config_service.ENVIRONMENT = "production"
+        config_service.IAP_EXPECTED_AUDIENCE = "test-iap-audience"
+        config_service.ALLOWED_ORGS_STR = ""
+        config_service.WORKFORCE_POOL_ID = ""
+
+        oid = "11111111-2222-3333-4444-555555555555"
+        mock_request = MagicMock(spec=Request)
+        mock_verify.return_value = {
+            "sub": (
+                "principal://iam.googleapis.com/locations/global/"
+                f"workforcePools/pool/subject/{oid}"
+            ),
+            "name": "Federated User",
+        }
+        mock_user_service.create_user_if_not_exists.return_value = UserModel(
+            id=9,
+            email="resolved@corp.com",
+            entra_oid=oid,
+            name="Federated User",
+            roles=["user"],
+        )
+
+        user = await get_current_user(
+            request=mock_request,
+            token="valid_iap_jwt",
+            user_service=mock_user_service,
+        )
+
+        assert user.email == "resolved@corp.com"
+        mock_user_service.create_user_if_not_exists.assert_called_once_with(
+            email=None,
+            name="Federated User",
+            picture="",
+            entra_oid=oid,
+        )
+
+    @pytest.mark.anyio
+    @patch("src.auth.auth_guard.id_token.verify_token")
+    async def test_get_current_user_iap_missing_email_non_workforce_does_not_fallback_to_sub(
         self, mock_verify, mock_user_service
     ):
         config_service.ENVIRONMENT = "production"
@@ -274,12 +315,8 @@ class TestGetCurrentUser:
 
         mock_request = MagicMock(spec=Request)
         mock_verify.return_value = {
-            "sub": (
-                "principal://iam.googleapis.com/locations/global/"
-                "workforcePools/pool/subject/"
-                "11111111-2222-3333-4444-555555555555"
-            ),
-            "name": "Federated User",
+            "sub": "accounts.google.com:1234567890",
+            "name": "Google User Without Email",
         }
 
         with pytest.raises(HTTPException) as exc_info:

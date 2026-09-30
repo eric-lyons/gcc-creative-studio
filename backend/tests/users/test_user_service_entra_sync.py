@@ -21,7 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.auth.entra_graph_client import EntraGraphError
+from src.auth.entra_graph_client import (
+    EntraGraphError,
+    EntraUserNotFoundError,
+)
 from src.config.config_service import ConfigService
 from src.users.repository.user_repository import UserRepository
 from src.users.user_model import UserModel, UserRoleEnum
@@ -56,6 +59,9 @@ def fixture_graph():
     client = MagicMock()
     client.member_group_ids = AsyncMock(return_value=set())
     client.get_user_emails = AsyncMock(return_value={"alice@corp.com"})
+    client.get_user_profile = AsyncMock(
+        return_value=("alice@corp.com", "Alice Graph", {"alice@corp.com"})
+    )
     with patch(
         "src.users.user_service.get_entra_graph_client", return_value=client
     ):
@@ -384,6 +390,122 @@ class TestEntraRoleSync:
 
         assert exc_info.value.status_code == 403
         graph.member_group_ids.assert_not_called()
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_missing_email_resolves_profile_from_graph_and_creates_user(
+        self, repo, graph
+    ):
+        repo.get_by_entra_oid.return_value = None
+        repo.get_by_email.return_value = None
+        graph.get_user_profile.return_value = (
+            "alice@corp.com",
+            "Alice From Graph",
+            {"alice@corp.com", "alice.upn@corp.com"},
+        )
+        graph.member_group_ids.return_value = {CREATOR_G}
+
+        await UserService(user_repo=repo).create_user_if_not_exists(
+            email=None, name="", picture="", entra_oid=OID_1
+        )
+
+        graph.get_user_profile.assert_called_once_with(OID_1)
+        graph.get_user_emails.assert_not_called()
+        created = repo.create.call_args.args[0]
+        assert created["email"] == "alice@corp.com"
+        assert created["name"] == "Alice From Graph"
+        assert created["entra_oid"] == OID_1
+        assert created["roles"] == ["user", "creator"]
+
+    @pytest.mark.anyio
+    async def test_missing_email_links_existing_unlinked_upn_row_without_second_graph_user_call(
+        self, repo, graph
+    ):
+        repo.get_by_entra_oid.return_value = None
+        unlinked = _user(
+            [UserRoleEnum.USER],
+            email="alice.upn@corp.com",
+            entra_oid=None,
+            checked_at=_stale(),
+        )
+        repo.get_by_email.side_effect = (
+            lambda addr, include_deleted=False: unlinked
+            if addr == "alice.upn@corp.com"
+            else None
+        )
+        graph.get_user_profile.return_value = (
+            "alice@corp.com",
+            "Alice",
+            {"alice@corp.com", "alice.upn@corp.com"},
+        )
+        graph.member_group_ids.return_value = {ADMIN_G}
+
+        await UserService(user_repo=repo).create_user_if_not_exists(
+            email=None, name="", picture="", entra_oid=OID_1
+        )
+
+        graph.get_user_profile.assert_called_once_with(OID_1)
+        graph.get_user_emails.assert_not_called()
+        _, data = repo.update.call_args.args
+        assert data["entra_oid"] == OID_1
+        assert data["roles"] == ["user", "admin"]
+
+    @pytest.mark.anyio
+    async def test_missing_email_with_existing_oid_row_skips_graph_profile_lookup(
+        self, repo, graph
+    ):
+        existing = _user(
+            [UserRoleEnum.USER], entra_oid=OID_1, checked_at=NOW
+        )
+        repo.get_by_entra_oid.return_value = existing
+
+        result = await UserService(user_repo=repo).create_user_if_not_exists(
+            email=None, name="", picture="", entra_oid=OID_1
+        )
+
+        assert result is existing
+        graph.get_user_profile.assert_not_called()
+        graph.member_group_ids.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_missing_email_returns_503_when_graph_profile_lookup_fails(
+        self, repo, graph
+    ):
+        repo.get_by_entra_oid.return_value = None
+        graph.get_user_profile.side_effect = EntraGraphError("timeout")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await UserService(user_repo=repo).create_user_if_not_exists(
+                email=None, name="", picture="", entra_oid=OID_1
+            )
+
+        assert exc_info.value.status_code == 503
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_missing_email_returns_403_when_graph_user_not_found_or_email_empty(
+        self, repo, graph
+    ):
+        repo.get_by_entra_oid.return_value = None
+        graph.get_user_profile.side_effect = EntraUserNotFoundError("404")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await UserService(user_repo=repo).create_user_if_not_exists(
+                email=None, name="", picture="", entra_oid=OID_1
+            )
+
+        assert exc_info.value.status_code == 403
+        repo.create.assert_not_called()
+
+        graph.get_user_profile.side_effect = None
+        graph.get_user_profile.return_value = (None, "No Email", set())
+
+        with pytest.raises(HTTPException) as exc_info2:
+            await UserService(user_repo=repo).create_user_if_not_exists(
+                email=None, name="", picture="", entra_oid=OID_1
+            )
+
+        assert exc_info2.value.status_code == 403
         repo.create.assert_not_called()
 
 

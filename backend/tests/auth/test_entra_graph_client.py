@@ -169,6 +169,52 @@ async def test_get_user_emails_returns_lowercased_mail_and_upn():
 
 
 @pytest.mark.anyio
+async def test_get_user_profile_returns_mail_display_name_and_all_emails():
+    oid = "11111111-2222-3333-4444-555555555555"
+    fake = FakeGraph(
+        user_profile={
+            "id": oid,
+            "mail": " Alice@Corp.COM ",
+            "userPrincipalName": "Alice.UPN@Corp.COM",
+            "displayName": " Alice Smith ",
+        }
+    )
+    client = make_client(fake)
+
+    primary_email, display_name, all_emails = await client.get_user_profile(oid)
+
+    assert primary_email == "alice@corp.com"
+    assert display_name == "Alice Smith"
+    assert all_emails == {"alice@corp.com", "alice.upn@corp.com"}
+    user_calls = fake.calls(f"/v1.0/users/{oid}")
+    assert len(user_calls) == 1
+    assert (
+        user_calls[0].url.params["$select"]
+        == "id,mail,userPrincipalName,displayName"
+    )
+
+
+@pytest.mark.anyio
+async def test_get_user_profile_falls_back_to_upn_when_mail_is_null():
+    oid = "11111111-2222-3333-4444-555555555555"
+    fake = FakeGraph(
+        user_profile={
+            "id": oid,
+            "mail": None,
+            "userPrincipalName": "Alice.UPN@Corp.COM",
+            "displayName": None,
+        }
+    )
+    client = make_client(fake)
+
+    primary_email, display_name, all_emails = await client.get_user_profile(oid)
+
+    assert primary_email == "alice.upn@corp.com"
+    assert display_name is None
+    assert all_emails == {"alice.upn@corp.com"}
+
+
+@pytest.mark.anyio
 async def test_get_user_emails_404_raises_user_not_found():
     fake = FakeGraph(user_exists=False)
     client = make_client(fake)
