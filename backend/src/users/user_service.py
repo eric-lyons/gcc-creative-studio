@@ -43,6 +43,16 @@ def _roles_check_due(user: UserModel, now: datetime.datetime) -> bool:
     ) >= datetime.timedelta(seconds=config_service.ENTRA_ROLE_SYNC_TTL_SECONDS)
 
 
+def _is_deployer_admin(email: str) -> bool:
+    """True when `email` matches the configured break-glass deployer email."""
+    admin_email = (
+        (getattr(config_service, "ADMIN_USER_EMAIL", "") or "").strip().lower()
+    )
+    if not admin_email or admin_email == "system":
+        return False
+    return email.strip().lower() == admin_email
+
+
 class UserService:
     """Handles the business logic for user management."""
 
@@ -62,7 +72,10 @@ class UserService:
 
         Users with `entra_oid` are keyed by that immutable object ID. An
         existing unlinked row with the same email is linked once (confirmed via
-        Microsoft Graph when role sync is enabled).
+        Microsoft Graph when role sync is enabled). On any Graph sync failure,
+        privileged roles (`admin`, `creator`, `workflows`) are removed
+        immediately except for the deployer (`ADMIN_USER_EMAIL`), who always
+        retains `admin`.
         """
         email = email.strip().lower()
         if entra_oid is not None:
@@ -135,9 +148,25 @@ class UserService:
                 if sync_enabled
                 else None
             )
-            user_data["roles"] = _role_values(
-                entra_roles or {UserRoleEnum.USER}
-            )
+            initial_roles = entra_roles or {UserRoleEnum.USER}
+            if sync_enabled and _is_deployer_admin(email):
+                if entra_oid is not None:
+                    # Confirm that the OID actually owns ADMIN_USER_EMAIL in Graph
+                    # before granting break-glass admin on an unseeded JIT row.
+                    try:
+                        await self._confirm_oid_email_via_graph(
+                            entra_oid, email
+                        )
+                        initial_roles = self._apply_deployer_admin_safeguard(
+                            email, initial_roles
+                        )
+                    except HTTPException:
+                        pass
+                else:
+                    initial_roles = self._apply_deployer_admin_safeguard(
+                        email, initial_roles
+                    )
+            user_data["roles"] = _role_values(initial_roles)
             if sync_enabled:
                 user_data["roles_checked_at"] = now
             return await self.user_repo.create(user_data)
@@ -152,8 +181,9 @@ class UserService:
                 )
             return existing_user
 
-        # TTL expired: bump the marker even if Graph fails (fail-static,
-        # retry after the next TTL) so an outage doesn't hammer Graph.
+        # TTL expired: fail-closed for privileged roles on Graph error (except
+        # the deployer keeps admin), and advance roles_checked_at so we retry
+        # after one TTL instead of hammering Graph.
         updates: dict[str, Any] = {"roles_checked_at": now}
         if pending_link_oid is not None:
             updates["entra_oid"] = pending_link_oid
@@ -161,19 +191,21 @@ class UserService:
         entra_roles = await self._fetch_entra_roles(
             lookup_ref, existing_user.email
         )
-        if entra_roles is not None:
-            target = await self._apply_last_admin_safeguard(
-                existing_user, entra_roles
+        raw_target = (
+            entra_roles if entra_roles is not None else {UserRoleEnum.USER}
+        )
+        target = self._apply_deployer_admin_safeguard(
+            existing_user.email, raw_target
+        )
+        current = {UserRoleEnum(r) for r in existing_user.roles}
+        if target != current:
+            updates["roles"] = _role_values(target)
+            logger.info(
+                "Entra role sync for %s: %s -> %s",
+                existing_user.email,
+                _role_values(current),
+                updates["roles"],
             )
-            current = {UserRoleEnum(r) for r in existing_user.roles}
-            if target != current:
-                updates["roles"] = _role_values(target)
-                logger.info(
-                    "Entra role sync for %s: %s -> %s",
-                    existing_user.email,
-                    _role_values(current),
-                    updates["roles"],
-                )
         return (
             await self.user_repo.update(existing_user.id, updates)
             or existing_user
@@ -232,7 +264,7 @@ class UserService:
             )
         except EntraGraphError as exc:
             logger.error(
-                "Entra role sync failed for %s; keeping existing roles: %s",
+                "Entra role sync failed for %s; removing privileged roles: %s",
                 log_email or user_ref,
                 exc,
             )
@@ -242,19 +274,16 @@ class UserService:
             roles.update(UserRoleEnum(r) for r in group_roles.get(group_id, ()))
         return roles
 
-    async def _apply_last_admin_safeguard(
-        self, existing_user: UserModel, target: set[UserRoleEnum]
+    def _apply_deployer_admin_safeguard(
+        self, user_email: str, target: set[UserRoleEnum]
     ) -> set[UserRoleEnum]:
-        """Entra is authoritative, except it may not remove the last admin."""
-        if (
-            UserRoleEnum.ADMIN in existing_user.roles
-            and UserRoleEnum.ADMIN not in target
-            and await self.user_repo.count_admins() <= 1
-        ):
+        """The deployer (ADMIN_USER_EMAIL) is the break-glass admin and is
+        exempt from Entra-driven removal of the admin role."""
+        if UserRoleEnum.ADMIN not in target and _is_deployer_admin(user_email):
             logger.warning(
-                "Entra removed admin from %s, but they are the last admin; "
-                "keeping the admin role.",
-                existing_user.email,
+                "Entra sync would remove admin from deployer %s; "
+                "keeping the admin role (break-glass exemption).",
+                user_email,
             )
             return target | {UserRoleEnum.ADMIN}
         return target

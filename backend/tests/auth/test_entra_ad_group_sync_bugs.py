@@ -56,9 +56,9 @@ def _user(**overrides) -> UserModel:
 
 
 class TestRoleSourceIsNotTheIapToken:
-    def test_wif_attribute_mapping_uses_oid_subject(self):
-        """IAP drops google.groups from its JWT, so mapping it is dead weight,
-        and google.subject maps to assertion.oid (immutable Entra object ID)."""
+    def test_wif_attribute_mapping_uses_oid_and_no_groups(self):
+        """WIF maps google.subject to assertion.oid (immutable Entra object ID)
+        and does not map google.groups."""
         content = (
             REPO_ROOT / "infra/modules/iap-load-balancer/main.tf"
         ).read_text(encoding="utf-8")
@@ -116,11 +116,12 @@ class TestAuthDefectsStayFixed:
 
     @pytest.mark.anyio
     @patch("src.auth.auth_guard.id_token.verify_token")
-    async def test_sub_only_token_is_rejected_even_without_allowed_orgs(
+    async def test_sub_only_token_is_rejected_when_allowed_orgs_set(
         self, mock_verify
     ):
-        """A WIF principal URI without an email claim or a non-GUID subject is
-        rejected (fail closed) instead of using sub as email."""
+        """A WIF principal URI has no email domain, so an org allowlist
+        rejects it (fail closed) instead of provisioning a junk user."""
+        config_service.ALLOWED_ORGS_STR = "yourcompany.com"
         mock_verify.return_value = {
             "sub": "principal://iam.googleapis.com/locations/global/"
             "workforcePools/pool/subject/abc123"
@@ -163,9 +164,11 @@ _ADMIN_GROUP = "aaaaaaaa-0000-0000-0000-000000000001"
 _TOKEN_OK = {"access_token": "tok", "expires_in": 3600}
 
 
-class TestMalformedGraphResponsesFailStatic:
+class TestMalformedGraphResponsesFailClosedWithoutLogout:
     """A 200 with an unparseable Graph or token body is a Graph failure:
-    the user keeps their roles and the TTL marker advances (no 401/500)."""
+    it must not raise 401/500 (which would log the user out), removes
+    privileged roles for non-deployer users, preserves admin for the deployer,
+    and advances the TTL marker."""
 
     @pytest.mark.parametrize(
         "token_body, graph_body",
@@ -181,7 +184,7 @@ class TestMalformedGraphResponsesFailStatic:
     )
     @pytest.mark.anyio
     @patch("src.auth.auth_guard.id_token.verify_token")
-    async def test_malformed_body_keeps_roles_and_advances_marker(
+    async def test_malformed_body_removes_privileged_roles_and_advances_marker(
         self, mock_verify, token_body, graph_body
     ):
         mock_verify.return_value = {"email": "alice@company.com"}
@@ -220,6 +223,7 @@ class TestMalformedGraphResponsesFailStatic:
             ENTRA_ROLE_SYNC_ENABLED=True,
             ENTRA_ROLE_SYNC_TTL_SECONDS=600,
             ENTRA_GROUP_ROLES={_ADMIN_GROUP: frozenset({"admin"})},
+            ADMIN_USER_EMAIL="system",
         )
 
         with (
@@ -235,12 +239,9 @@ class TestMalformedGraphResponsesFailStatic:
                 user_service=UserService(user_repo=repo),
             )
 
-        assert {UserRoleEnum(r) for r in user.roles} == {
-            UserRoleEnum.USER,
-            UserRoleEnum.ADMIN,
-        }
+        assert {UserRoleEnum(r) for r in user.roles} == {UserRoleEnum.USER}
         repo.update.assert_called_once()
         uid, updates = repo.update.call_args.args
         assert uid == stale_user.id
-        assert set(updates) == {"roles_checked_at"}
+        assert updates["roles"] == ["user"]
         assert updates["roles_checked_at"] > stale_marker
