@@ -16,13 +16,17 @@
 IAP token, and the surrounding auth defects stay fixed.
 """
 
+import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import HTTPException, Request
 
 from src.auth.auth_guard import get_current_user
+from src.auth.entra_graph_client import EntraGraphClient
 from src.config.config_service import config_service
 from src.users.user_model import UserModel, UserRoleEnum
 from src.users.user_service import UserService
@@ -154,3 +158,90 @@ class TestAuthDefectsStayFixed:
             "gone@company.com", include_deleted=True
         )
         repo.create.assert_not_called()
+
+
+_ADMIN_GROUP = "aaaaaaaa-0000-0000-0000-000000000001"
+_TOKEN_OK = {"access_token": "tok", "expires_in": 3600}
+
+
+class TestMalformedGraphResponsesFailStatic:
+    """A 200 with an unparseable Graph or token body is a Graph failure:
+    the user keeps their roles and the TTL marker advances (no 401/500)."""
+
+    @pytest.mark.parametrize(
+        "token_body, graph_body",
+        [
+            pytest.param(b"<html>login</html>", None, id="a-token-non-json"),
+            pytest.param(_TOKEN_OK, b"not json", id="b-graph-non-json"),
+            pytest.param(
+                {"token_type": "Bearer", "expires_in": 3600},
+                None,
+                id="c-token-missing-access-token",
+            ),
+        ],
+    )
+    @pytest.mark.anyio
+    @patch("src.auth.auth_guard.id_token.verify_token")
+    async def test_malformed_body_keeps_roles_and_advances_marker(
+        self, mock_verify, token_body, graph_body
+    ):
+        mock_verify.return_value = {"email": "alice@company.com"}
+        stale_marker = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+            seconds=601
+        )
+        stale_user = _user(
+            roles=[UserRoleEnum.USER, UserRoleEnum.ADMIN],
+            roles_checked_at=stale_marker,
+        )
+        repo = AsyncMock()
+        repo.get_by_email.return_value = stale_user
+        repo.update.side_effect = lambda uid, data: stale_user.model_copy(
+            update=data
+        )
+
+        def respond(body):
+            if isinstance(body, bytes):
+                return httpx.Response(200, content=body)
+            return httpx.Response(200, json=body)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "login.microsoftonline.com":
+                return respond(token_body)
+            return respond(graph_body)
+
+        graph_client = EntraGraphClient(
+            "tenant",
+            "client",
+            "secret",
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ),
+        )
+        sync_config = SimpleNamespace(
+            ENTRA_ROLE_SYNC_ENABLED=True,
+            ENTRA_ROLE_SYNC_TTL_SECONDS=600,
+            ENTRA_GROUP_ROLES={_ADMIN_GROUP: frozenset({"admin"})},
+        )
+
+        with (
+            patch("src.users.user_service.config_service", sync_config),
+            patch(
+                "src.users.user_service.get_entra_graph_client",
+                return_value=graph_client,
+            ),
+        ):
+            user = await get_current_user(
+                request=MagicMock(spec=Request),
+                token="jwt",
+                user_service=UserService(user_repo=repo),
+            )
+
+        assert {UserRoleEnum(r) for r in user.roles} == {
+            UserRoleEnum.USER,
+            UserRoleEnum.ADMIN,
+        }
+        repo.update.assert_called_once()
+        uid, updates = repo.update.call_args.args
+        assert uid == stale_user.id
+        assert set(updates) == {"roles_checked_at"}
+        assert updates["roles_checked_at"] > stale_marker

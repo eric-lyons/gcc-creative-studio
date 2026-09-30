@@ -215,6 +215,34 @@ class TestGetCurrentUser:
 
     @pytest.mark.anyio
     @patch("src.auth.auth_guard.id_token.verify_token")
+    async def test_get_current_user_value_error_after_verification_is_not_iap_401(
+        self, mock_verify, mock_user_service
+    ):
+        config_service.ENVIRONMENT = "production"
+        config_service.IAP_EXPECTED_AUDIENCE = "test-iap-audience"
+        config_service.ALLOWED_ORGS_STR = ""
+
+        mock_request = MagicMock(spec=Request)
+        mock_verify.return_value = {
+            "email": "iap_user@example.com",
+            "name": "IAP User",
+        }
+        mock_user_service.create_user_if_not_exists.side_effect = ValueError(
+            "db boom"
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(
+                request=mock_request,
+                token="valid_iap_jwt",
+                user_service=mock_user_service,
+            )
+
+        assert exc_info.value.status_code != 401
+        assert "Invalid IAP authentication token" not in exc_info.value.detail
+
+    @pytest.mark.anyio
+    @patch("src.auth.auth_guard.id_token.verify_token")
     async def test_get_current_user_iap_allowed_orgs_fail(
         self, mock_verify, mock_user_service
     ):

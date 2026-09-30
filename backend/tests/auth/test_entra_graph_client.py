@@ -201,6 +201,102 @@ async def test_token_failure_raises_entra_graph_error():
         await client.member_group_ids("a@corp.com", ["g1"])
 
 
+def _body_response(body) -> httpx.Response:
+    if isinstance(body, bytes):
+        return httpx.Response(200, content=body)
+    return httpx.Response(200, json=body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not json",
+        {"token_type": "Bearer"},
+        [],
+        {"access_token": "tok", "expires_in": "soon"},
+    ],
+    ids=["non-json", "no-access-token", "list", "bad-expires-in"],
+)
+@pytest.mark.anyio
+async def test_malformed_token_body_raises_entra_graph_error(body):
+    async def handler(request):
+        return _body_response(body)
+
+    client = EntraGraphClient(
+        "t",
+        "c",
+        "s",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(EntraGraphError):
+        await client.member_group_ids("a@corp.com", ["g1"])
+    assert client._token is None  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not json",
+        {},
+        {"value": None},
+        {"value": 5},
+        {"value": "abc"},
+        [],
+        {"value": [1]},
+    ],
+    ids=[
+        "non-json",
+        "missing-value",
+        "null-value",
+        "int-value",
+        "str-value",
+        "list-body",
+        "non-str-group",
+    ],
+)
+@pytest.mark.anyio
+async def test_malformed_check_member_groups_body_raises_entra_graph_error(
+    body,
+):
+    async def handler(request):
+        if request.url.host == TOKEN_HOST:
+            return httpx.Response(200, json={"access_token": "tok"})
+        return _body_response(body)
+
+    client = EntraGraphClient(
+        "t",
+        "c",
+        "s",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(EntraGraphError):
+        await client.member_group_ids("a@corp.com", ["abc"])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"value": [{}]}, {"value": ["x"]}],
+    ids=["user-without-id", "non-object-user"],
+)
+@pytest.mark.anyio
+async def test_malformed_mail_lookup_body_raises_entra_graph_error(body):
+    async def handler(request):
+        if request.url.host == TOKEN_HOST:
+            return httpx.Response(200, json={"access_token": "tok"})
+        if request.url.path.endswith("/checkMemberGroups"):
+            return httpx.Response(404)
+        return _body_response(body)
+
+    client = EntraGraphClient(
+        "t",
+        "c",
+        "s",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(EntraGraphError):
+        await client.member_group_ids("a@corp.com", ["g1"])
+
+
 @pytest.mark.anyio
 async def test_concurrent_lookups_for_same_email_share_one_round_trip():
     fake = FakeGraph(members={"g1"})

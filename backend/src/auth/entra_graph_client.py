@@ -96,7 +96,7 @@ class EntraGraphClient:
     ) -> set[str]:
         matched: set[str] = set()
         for start in range(0, len(group_ids), _MAX_GROUP_IDS_PER_CALL):
-            response = await self._request(
+            value = await self._request(
                 "POST",
                 f"/users/{user_ref}/checkMemberGroups",
                 json={
@@ -105,12 +105,17 @@ class EntraGraphClient:
                     ]
                 },
             )
-            matched.update(g.lower() for g in response.json().get("value", []))
+            if not all(isinstance(g, str) for g in value):
+                raise EntraGraphError(
+                    f"Malformed Graph response for {user_ref}: non-string "
+                    "group id"
+                )
+            matched.update(g.lower() for g in value)
         return matched
 
     async def _find_user_id_by_mail(self, email: str) -> str:
         literal = email.replace("'", "''")  # OData string-literal escaping
-        response = await self._request(
+        users = await self._request(
             "GET",
             "/users",
             params={
@@ -123,16 +128,22 @@ class EntraGraphClient:
             },
             headers={"ConsistencyLevel": "eventual"},
         )
-        users = response.json().get("value", [])
         if len(users) != 1:
             raise EntraUserNotFoundError(
                 f"{len(users)} Entra users match mail {email!r}"
             )
-        return users[0]["id"]
+        try:
+            return users[0]["id"]
+        except (KeyError, TypeError) as exc:
+            raise EntraGraphError(
+                f"Malformed Graph user entry for mail {email!r}: {exc}"
+            ) from exc
 
     async def _request(
         self, method: str, path: str, headers: dict | None = None, **kwargs
-    ) -> httpx.Response:
+    ) -> list:
+        """Returns the `value` list of a Graph response; any malformed body
+        raises EntraGraphError so callers keep existing roles."""
         token = await self._get_app_token()
         try:
             response = await self._http.request(
@@ -149,7 +160,18 @@ class EntraGraphClient:
             raise EntraGraphError(
                 f"Graph HTTP {response.status_code} for {path}"
             )
-        return response
+        try:
+            value = response.json()["value"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise EntraGraphError(
+                f"Malformed Graph response for {path}: {exc}"
+            ) from exc
+        if not isinstance(value, list):
+            raise EntraGraphError(
+                f"Malformed Graph response for {path}: 'value' is "
+                f"{type(value).__name__}, not list"
+            )
+        return value
 
     async def _get_app_token(self) -> str:
         if self._token and time.monotonic() < self._token_expires_at:
@@ -173,12 +195,17 @@ class EntraGraphClient:
                 raise EntraGraphError(
                     f"Token request failed: HTTP {response.status_code}"
                 )
-            body = response.json()
-            self._token = body["access_token"]
+            try:
+                body = response.json()
+                token = body["access_token"]
+                expires_in = int(body.get("expires_in", 3600))
+            except (ValueError, KeyError, TypeError) as exc:
+                raise EntraGraphError(
+                    f"Malformed token response: {exc}"
+                ) from exc
+            self._token = token
             self._token_expires_at = (
-                time.monotonic()
-                + int(body.get("expires_in", 3600))
-                - _TOKEN_EXPIRY_SKEW_SECONDS
+                time.monotonic() + expires_in - _TOKEN_EXPIRY_SKEW_SECONDS
             )
             return self._token
 

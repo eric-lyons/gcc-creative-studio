@@ -82,13 +82,20 @@ async def get_current_user(
             return user_doc
 
         # Verify Google-signed IAP JWT assertion
-        decoded_token = await asyncio.to_thread(
-            id_token.verify_token,
-            token,
-            google_auth_requests.Request(),
-            audience=config_service.IAP_EXPECTED_AUDIENCE,
-            certs_url="https://www.gstatic.com/iap/verify/public_key",
-        )
+        try:
+            decoded_token = await asyncio.to_thread(
+                id_token.verify_token,
+                token,
+                google_auth_requests.Request(),
+                audience=config_service.IAP_EXPECTED_AUDIENCE,
+                certs_url="https://www.gstatic.com/iap/verify/public_key",
+            )
+        except ValueError as exc:
+            logger.error("[get_current_user - Invalid IAP Token]: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid IAP authentication token: {exc}",
+            ) from exc
 
         logger.info("Decoded IAP Token Claims: %s", list(decoded_token.keys()))
         logger.info(
@@ -163,12 +170,6 @@ async def get_current_user(
 
         return user_doc
 
-    except ValueError as exc:
-        logger.error("[get_current_user - Invalid IAP Token]: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid IAP authentication token: {exc}",
-        ) from exc
     except HTTPException as e:
         logger.error("[get_current_user - HTTPException]: %s", e)
         raise e
